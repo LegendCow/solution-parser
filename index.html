@@ -96,6 +96,12 @@
             </div>
           </div>
         </div>
+        <div class="row">
+          <div>
+            <label for="maxReach">Max Reach</label>
+            <input id="maxReach" type="text" value="0" readonly />
+          </div>
+        </div>
         <div class="actions">
           <label class="check-inline" for="facingBet"><input id="facingBet" type="checkbox" /> <span>Facing Bet</span></label>
         </div>
@@ -334,6 +340,7 @@
       const actionCount = actionLabels.length;
       return {
         ...meta,
+        maxReach: clamp(safeNumber(meta.maxReach, 0), 0, 1),
         actionSizes: sizesAsc,
         actionLabels,
         actionCount,
@@ -388,6 +395,7 @@
       return {
         nodeId: Math.max(0, Math.round(safeNumber(byId("nodeId").value, 0))),
         facingBet: byId("facingBet").checked,
+        maxReach: app.state.meta.maxReach,
         hasEquity: app.state.meta.hasEquity,
         hasNodeEv: app.state.meta.hasNodeEv,
         foldEvOmitted: false,
@@ -398,9 +406,24 @@
     function syncControlsFromState() {
       const meta = app.state.meta;
       byId("nodeId").value = meta.nodeId;
+      byId("maxReach").value = formatNumber(meta.maxReach || 0, 6);
       byId("facingBet").checked = meta.facingBet;
       byId("paintMode").value = app.state.editMode;
       byId("brushPercent").value = app.state.brushPercent;
+    }
+
+    function computeMaxReach(weights) {
+      let maxValue = 0;
+      for (let i = 0; i < weights.length; i += 1) {
+        if (weights[i] > maxValue) maxValue = weights[i];
+      }
+      return maxValue;
+    }
+
+    function normalizedDisplayWeight(weight) {
+      const maxReach = app.state.meta.maxReach || 0;
+      if (maxReach <= EPSILON) return 0;
+      return clamp(weight / maxReach, 0, 1);
     }
 
     function syncExportName(force) {
@@ -500,15 +523,20 @@
 
     function cellStats(comboIds) {
       const actionTotals = new Array(app.state.meta.actionCount).fill(0);
+      const displayActionTotals = new Array(app.state.meta.actionCount).fill(0);
       let weightedCombos = 0;
       let activeCombos = 0;
       for (const comboId of comboIds) {
         const weight = app.state.weights[comboId];
+        const displayWeight = normalizedDisplayWeight(weight);
         if (weight > EPSILON) activeCombos += 1;
         weightedCombos += weight;
-        for (let i = 0; i < actionTotals.length; i += 1) actionTotals[i] += weight * app.state.strategy[comboId][i];
+        for (let i = 0; i < actionTotals.length; i += 1) {
+          actionTotals[i] += weight * app.state.strategy[comboId][i];
+          displayActionTotals[i] += displayWeight * app.state.strategy[comboId][i];
+        }
       }
-      return { weightedCombos, activeCombos, actionTotals };
+      return { weightedCombos, activeCombos, actionTotals, displayActionTotals };
     }
 
     function renderGrid() {
@@ -519,7 +547,7 @@
         const selected = app.state.selectedCellKey === key && app.state.selectedComboId == null;
         return `
           <div class="hand-cell${selected ? " selected" : ""}${inactive ? " inactive" : ""}" data-hand-key="${key}" data-active="${inactive ? "0" : "1"}">
-            <div class="bar">${renderSegmentsHtml(makeBarSegments(stats.actionTotals, hand.maxCombos))}</div>
+            <div class="bar">${renderSegmentsHtml(makeBarSegments(stats.displayActionTotals, hand.maxCombos))}</div>
             <div class="label">${key}</div>
           </div>
         `;
@@ -549,7 +577,8 @@
         ${comboIds.map((comboId) => {
         const combo = app.catalog.combos[comboId];
         const selected = app.state.selectedComboId === comboId;
-        const weighted = app.state.strategy[comboId].map((value) => value * app.state.weights[comboId]);
+        const displayWeight = normalizedDisplayWeight(app.state.weights[comboId]);
+        const weighted = app.state.strategy[comboId].map((value) => value * displayWeight);
         return `
           <div class="combo-chip${selected ? " selected" : ""}" data-combo-id="${comboId}">
             <div class="bar">${renderSegmentsHtml(makeBarSegments(weighted, 1))}</div>
@@ -708,7 +737,6 @@
       const currentValue = next[actionIndex];
       const delta = targetValue - currentValue;
       if (delta > 0) {
-        // Prefer consuming the residual/default action first.
         const fromDefault = Math.min(next[lastIndex], delta);
         next[lastIndex] -= fromDefault;
         let remainingDelta = delta - fromDefault;
@@ -730,7 +758,6 @@
           }
         }
       } else if (delta < 0) {
-        // When reducing an explicit action, return the freed mass to the default action.
         next[lastIndex] += -delta;
       }
 
@@ -772,6 +799,7 @@
       if (input.hasNodeEv) flags |= 1 << 1;
       if (input.foldEvOmitted) flags |= 1 << 2;
       if (input.facingBet) flags |= 1 << 3;
+      if (input.hasMaxReachScaling) flags |= 1 << 4;
       view.setUint32(0, MAGIC, true);
       view.setUint16(4, 1, true);
       view.setUint16(6, flags, true);
@@ -782,7 +810,7 @@
       view.setUint8(19, input.strategyStoredCount);
       view.setUint8(20, input.evStoredCount);
       view.setUint8(21, 0);
-      view.setUint16(22, HEADER_SIZE, true);
+      view.setUint16(22, Math.round(clamp(input.maxReach || 0, 0, 1) * PROB_SCALE), true);
       view.setUint32(24, offsetWeights, true);
       view.setUint32(28, offsetStrategy, true);
       view.setUint32(32, offsetEquity, true);
@@ -811,7 +839,7 @@
       const actionCount = view.getUint8(18);
       const strategyStoredCount = view.getUint8(19);
       const evStoredCount = view.getUint8(20);
-      const headerSize = view.getUint16(22, true);
+      const encodedMaxReach = view.getUint16(22, true);
       const offsetWeights = view.getUint32(24, true);
       const offsetStrategy = view.getUint32(28, true);
       const storedOffsetEquity = view.getUint32(32, true);
@@ -824,6 +852,8 @@
       const hasNodeEv = (flags & (1 << 1)) !== 0;
       const foldEvOmitted = (flags & (1 << 2)) !== 0;
       const facingBet = (flags & (1 << 3)) !== 0;
+      const hasMaxReachScaling = (flags & (1 << 4)) !== 0;
+      const maxReach = hasMaxReachScaling ? (encodedMaxReach / PROB_SCALE) : 1;
       const sizeCount = Math.max(0, actionCount - (facingBet ? 3 : 2));
       const weights = new Uint16Array(buffer, offsetWeights, comboCount);
       const strategy = new Uint16Array(buffer, offsetStrategy, comboCount * strategyStoredCount);
@@ -845,7 +875,8 @@
         actionCount,
         strategyStoredCount,
         evStoredCount,
-        headerSize,
+        maxReach,
+        hasMaxReachScaling,
         offsetActionSizes,
         offsetComboMask,
         offsetWeights,
@@ -873,6 +904,7 @@
       const meta = deriveMeta({
         nodeId: decoded.nodeId,
         facingBet: decoded.facingBet,
+        maxReach: decoded.maxReach,
         hasEquity: decoded.hasEquity,
         hasNodeEv: decoded.hasNodeEv,
         foldEvOmitted: decoded.foldEvOmitted,
@@ -892,7 +924,7 @@
       for (let i = 0; i < decoded.comboCount; i += 1) {
         const comboId = decoded.activeIds[i];
         if (comboId < 0 || comboId >= TOTAL_COMBOS) continue;
-        state.weights[comboId] = weightsFloat[i];
+        state.weights[comboId] = (weightsFloat[i] || 0) * meta.maxReach;
         const row = new Array(meta.actionCount).fill(0);
         let sum = 0;
         for (let j = 0; j < meta.strategyStoredCount; j += 1) {
@@ -971,7 +1003,6 @@
       if (app.zstd) return app.zstd;
       if (!app.zstdReady) {
         app.zstdReady = (async () => {
-          // Preferred path: ESM loader with explicit init API.
           try {
             const mod = await import("https://esm.sh/@oneidentity/zstd-js@1.0.3");
             if (mod && typeof mod.ZstdInit === "function") {
@@ -992,7 +1023,6 @@
             console.warn("Primary Zstd loader failed, trying fallback loader.", error);
           }
 
-          // Fallback path: legacy zstd-codec global loader.
           await loadScript("https://cdn.jsdelivr.net/npm/zstd-codec@0.1.5/lib/zstd-codec.js");
           await loadScript("https://cdn.jsdelivr.net/npm/zstd-codec@0.1.5/lib/zstd-codec-binding-wasm.js");
           const fallbackApi = await new Promise((resolve, reject) => {
@@ -1042,17 +1072,21 @@
       try {
         const compact = getCompactArrays();
         const meta = app.state.meta;
+        const maxReach = computeMaxReach(compact.weights);
+        const normalizedWeights = compact.weights.map((value) => (maxReach > EPSILON ? clamp(value / maxReach, 0, 1) : 0));
         const buffer = encodeNodeBlob({
           nodeId: meta.nodeId,
           comboCount: compact.activeIds.length,
           actionCount: meta.actionCount,
           strategyStoredCount: meta.strategyStoredCount,
           evStoredCount: meta.evStoredCount,
+          maxReach,
+          hasMaxReachScaling: true,
           hasEquity: meta.hasEquity,
           hasNodeEv: meta.hasNodeEv,
           foldEvOmitted: meta.foldEvOmitted,
           facingBet: meta.facingBet,
-          weights: quantizeUint16(compact.weights, PROB_SCALE),
+          weights: quantizeUint16(normalizedWeights, PROB_SCALE),
           strategy: quantizeUint16(compact.strategy, PROB_SCALE),
           actionSizes: new Uint16Array(meta.actionSizes),
           comboMask: buildComboMask(compact.activeIds),
@@ -1061,7 +1095,6 @@
           actionEv: quantizeInt16(compact.actionEv, EV_SCALE),
         });
         app.currentBuffer = buffer;
-        app.currentDecoded = decodeNodeBlob(buffer);
         renderHex(buffer, 256);
       } catch (error) {
         console.error(error);
@@ -1091,7 +1124,6 @@
         const buffer = isZstdBuffer(rawBuffer) || /\.zst$/i.test(file.name) ? await decompressZstd(rawBuffer) : rawBuffer;
         const decoded = decodeNodeBlob(buffer);
         app.currentBuffer = buffer;
-        app.currentDecoded = decoded;
         app.state = hydrateStateFromDecoded(decoded);
         renderAll();
         syncExportName(true);
@@ -1102,6 +1134,7 @@
     }
 
     function renderAll() {
+      app.state.meta.maxReach = computeMaxReach(app.state.weights);
       syncControlsFromState();
       syncExportName(false);
       renderMeta();
@@ -1238,6 +1271,7 @@
       app.gridKeys = built.gridKeys;
       app.state = createState({
         nodeId: 101,
+        maxReach: 0,
         facingBet: false,
         hasEquity: true,
         hasNodeEv: true,
